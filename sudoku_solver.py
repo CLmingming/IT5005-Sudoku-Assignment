@@ -3,14 +3,43 @@
 Implement the functions marked below. Do not modify utils.py or logic_.py.
 """
 
-from utils import *
-from logic_ import *
+from utils import expr
+from logic_ import (
+    PropDefiniteKB,
+    PropKB,
+    associate,
+    conjuncts,
+    defaultdict,
+    parse_definite_clause,
+    pl_fc_entails,
+)
 
 
 # Do not change this function; it is used to create atomic propositions.
 def atom(prefix, r, c, v):
     """prefix is 'Is' or 'Not'. Returns the Expr for e.g. Is3_2_4."""
     return expr(f'{prefix}{r}_{c}_{v}')
+
+
+class _IndexedPropDefiniteKB(PropDefiniteKB):
+    """PropDefiniteKB with the premise lookup cached for faster queries."""
+
+    def __init__(self):
+        super().__init__()
+        self._clauses_by_premise = defaultdict(list)
+        self._visited_by_forward_chaining = set()
+
+    def tell(self, sentence):
+        super().tell(sentence)
+        if sentence.op == '==>':
+            for premise in conjuncts(sentence.args[0]):
+                self._clauses_by_premise[premise].append(sentence)
+
+    def clauses_with_premise(self, premise):
+        # pl_fc_entails calls this for every fact it processes. Recording those
+        # facts lets a full-grid solve reuse one complete library inference run.
+        self._visited_by_forward_chaining.add(premise)
+        return self._clauses_by_premise.get(premise, ())
 
 
 def _peer_cells(n, box_h, box_w, r, c):
@@ -97,7 +126,7 @@ def build_definite_kb(n, box_h, box_w, givens):
     from the same cell), while a cell whose other candidates have all been
     eliminated gets a last-candidate rule concluding its remaining Is atom.
     """
-    kb = PropDefiniteKB()
+    kb = _IndexedPropDefiniteKB()
 
     # Fixed givens are base facts.
     for (r, c), v in givens.items():
@@ -171,45 +200,20 @@ def _prepare_definite_index(kb):
     kb._rules_by_conclusion = dict(rules)
 
 
-def _forward_closure(kb):
-    """Compute the least Horn closure once for a full-grid solve."""
-    _prepare_definite_index(kb)
-    inferred = set(kb._facts)
-
-    # A premise -> rules index makes the single forward pass efficient.
-    rules = []
-    rules_with_premise = defaultdict(list)
-    for conclusion, premise_lists in kb._rules_by_conclusion.items():
-        for premises in premise_lists:
-            idx = len(rules)
-            rules.append((premises, conclusion))
-            for premise in premises:
-                rules_with_premise[premise].append(idx)
-
-    counts = [len(premises) for premises, _ in rules]
-    agenda = list(kb._facts)
-    while agenda:
-        fact = agenda.pop()
-        for idx in rules_with_premise.get(fact, ()):
-            counts[idx] -= 1
-            if counts[idx] == 0:
-                conclusion = rules[idx][1]
-                if conclusion not in inferred:
-                    inferred.add(conclusion)
-                    agenda.append(conclusion)
-    return inferred
-
-
 def solve_full_grid_fc(n, box_h, box_w, givens):
-    """Solve the whole puzzle using the definite Horn knowledge base.
-
-    The supplied library's pl_fc_entails() is query-oriented and rebuilds its
-    counting state every time it is called. A full-grid solve needs the same
-    least-fixed-point forward-chaining computation for all cell queries, so we
-    compute that closure once and read all 81 answers from it.
-    """
+    """Solve the whole puzzle using the supplied forward-chaining function."""
     kb = build_definite_kb(n, box_h, box_w, givens)
-    inferred = _forward_closure(kb)
+
+    # This atom is outside every valid Sudoku query. Asking the supplied
+    # pl_fc_entails function about it makes that function exhaust its agenda;
+    # the indexed KB records every fact the library routine processes. This
+    # avoids reimplementing forward chaining and avoids repeating the same
+    # complete inference run hundreds of times for one grid.
+    sentinel = atom('Is', 0, 0, 0)
+    kb._visited_by_forward_chaining.clear()
+    pl_fc_entails(kb, sentinel)
+    inferred = kb._visited_by_forward_chaining
+
     solved = {}
     for r in range(1, n + 1):
         for c in range(1, n + 1):
@@ -232,6 +236,9 @@ def _backward_goal_closure(kb, query):
     relevant_rules = []
     seen_rules = set()
 
+    # Use an explicit stack rather than Python recursion. Sudoku's cyclic Horn
+    # dependency graph can exceed Python's recursion limit, but this performs
+    # the same goal-directed expansion safely.
     while pending:
         goal = pending.pop()
         for premises in kb._rules_by_conclusion.get(goal, ()):
